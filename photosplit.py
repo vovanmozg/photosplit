@@ -10,6 +10,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    import dlib
+except ImportError:  # pragma: no cover - optional dependency
+    dlib = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -77,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Сохранить промежуточные изображения в указанную папку",
+    )
+    parser.add_argument(
+        "--auto-orient",
+        action="store_true",
+        help="Автоматически определить ориентацию фотографии через dlib и повернуть её.",
+    )
+    parser.add_argument(
+        "--face-upsamples",
+        type=int,
+        default=1,
+        help="Количество апсемплирований для детектора лиц dlib (по умолчанию 1)",
     )
     return parser.parse_args()
 
@@ -187,6 +203,76 @@ def crop_margin(image: np.ndarray, crop: int) -> np.ndarray:
     return image[y0:y1, x0:x1]
 
 
+def rotate_image(image: np.ndarray, angle: int) -> np.ndarray:
+    if angle % 360 == 0:
+        return image
+    if angle == 90:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    if angle == 270 or angle == -90:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError(f"Unsupported rotation angle: {angle}")
+
+
+def resize_for_analysis(image: np.ndarray, max_side: int = 800) -> np.ndarray:
+    height, width = image.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return image
+    scale = max_side / float(longest)
+    new_size = (int(round(width * scale)), int(round(height * scale)))
+    return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+
+class DlibFaceOrientation:
+    def __init__(self, upsample: int = 1) -> None:
+        if dlib is None:
+            raise RuntimeError("dlib is not available")
+        self.detector = dlib.get_frontal_face_detector()
+        self.upsample = max(int(upsample), 0)
+
+    def _detect_faces(self, image: np.ndarray) -> int:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        try:
+            rectangles, scores, _ = self.detector.run(rgb, self.upsample, 0)
+            count = len(rectangles)
+        except Exception:  # pragma: no cover - fallback path for older dlib
+            rectangles = self.detector(rgb, self.upsample)
+            count = len(rectangles)
+        return int(count)
+
+    def estimate(self, image: np.ndarray) -> int:
+        sampled = resize_for_analysis(image)
+        scores: dict[int, int] = {}
+        for angle in (0, 90, 180, 270):
+            rotated = rotate_image(sampled, angle)
+            scores[angle] = self._detect_faces(rotated)
+
+        best_angle = max(scores, key=scores.get)
+        best_score = scores[best_angle]
+        if best_score <= 0 or best_angle == 0:
+            return 0
+
+        # Require unique best rotation; ties mean недостаточно уверенности.
+        second_best = max((score for angle, score in scores.items() if angle != best_angle), default=0)
+        if best_score == second_best:
+            return 0
+
+        return best_angle
+
+
+def auto_orient_photo(
+    image: np.ndarray, estimator: DlibFaceOrientation | None
+) -> tuple[np.ndarray, int]:
+    if estimator is None:
+        return image, 0
+    rotation = estimator.estimate(image)
+    if rotation == 0:
+        return image, 0
+    return rotate_image(image, rotation), rotation
+
+
 def main() -> int:
     args = parse_args()
 
@@ -205,6 +291,23 @@ def main() -> int:
     output_dir = args.output_dir or args.input.parent
     ensure_dir(output_dir)
     ensure_dir(args.debug_dir)
+
+    orientation_estimator: DlibFaceOrientation | None = None
+    if args.auto_orient:
+        if dlib is None:
+            print(
+                "Автоориентация выключена: модуль dlib не установлен.",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                orientation_estimator = DlibFaceOrientation(args.face_upsamples)
+            except Exception as exc:  # pragma: no cover - initialization errors
+                print(
+                    f"Автоориентация выключена: не удалось инициализировать dlib ({exc}).",
+                    file=sys.stderr,
+                )
+                orientation_estimator = None
 
     mask = preprocess(
         image,
@@ -239,6 +342,10 @@ def main() -> int:
         warped = warp_photo(image, box.astype("float32"))
         if crop > 0:
             warped = crop_margin(warped, crop)
+        if args.auto_orient and orientation_estimator is not None:
+            warped, rotation = auto_orient_photo(warped, orientation_estimator)
+            if rotation:
+                print(f"Фото {index} повернуто на {rotation} градусов")
         output_path = output_dir / f"{base_name}{args.suffix}{index:02d}{extension}"
         success = cv2.imwrite(str(output_path), warped)
         if not success:
