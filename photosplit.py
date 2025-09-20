@@ -16,6 +16,17 @@ except ImportError:  # pragma: no cover - optional dependency
     dlib = None
 
 
+SUPPORTED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".webp",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -26,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "input",
         type=Path,
-        help="Путь к сканированному изображению (JPEG/PNG и т.п.)",
+        help="Путь к папке с изображениями для обработки",
     )
     parser.add_argument(
         "--output-dir",
@@ -273,24 +284,115 @@ def auto_orient_photo(
     return rotate_image(image, rotation), rotation
 
 
+def process_image_file(
+    image_path: Path,
+    args: argparse.Namespace,
+    orientation_estimator: DlibFaceOrientation | None,
+) -> bool:
+    image = cv2.imread(str(image_path))
+    if image is None:
+        print(
+            f"[{image_path.name}] Пропущено: не удалось прочитать изображение.",
+            file=sys.stderr,
+        )
+        return False
+
+    output_dir = args.output_dir or image_path.parent
+    ensure_dir(output_dir)
+
+    debug_dir = None
+    if args.debug_dir:
+        debug_dir = args.debug_dir / image_path.stem
+        ensure_dir(debug_dir)
+
+    mask = preprocess(
+        image,
+        args.blur_kernel,
+        args.close_kernel,
+        *args.canny_thresholds,
+    )
+
+    total_area = float(image.shape[0] * image.shape[1])
+    min_area = total_area * max(args.min_area_ratio, 0.0)
+    photo_contours = find_photo_contours(mask, min_area)
+
+    if not photo_contours:
+        print(
+            f"[{image_path.name}] Фотографии не найдены."
+            " Попробуйте настроить параметры обнаружения.",
+            file=sys.stderr,
+        )
+        return False
+
+    def contour_key(item: tuple[np.ndarray, float]) -> tuple[float, float]:
+        box, _ = item
+        center = box.mean(axis=0)
+        return (center[1], center[0])
+
+    photo_contours.sort(key=contour_key)
+
+    base_name = image_path.stem
+    extension = image_path.suffix or ".jpg"
+    crop = max(args.crop, 0)
+    processed = 0
+
+    for index, (box, _area) in enumerate(photo_contours, start=1):
+        warped = warp_photo(image, box.astype("float32"))
+        if crop > 0:
+            warped = crop_margin(warped, crop)
+        if orientation_estimator is not None:
+            warped, rotation = auto_orient_photo(warped, orientation_estimator)
+            if rotation:
+                print(
+                    f"[{image_path.name}] Фото {index} повернуто на {rotation} градусов"
+                )
+        output_path = output_dir / f"{base_name}{args.suffix}{index:02d}{extension}"
+        success = cv2.imwrite(str(output_path), warped)
+        if not success:
+            print(f"[{image_path.name}] Не удалось сохранить {output_path}", file=sys.stderr)
+        else:
+            processed += 1
+
+    if debug_dir is not None:
+        debug_canvas = image.copy()
+        for idx, (box, _) in enumerate(photo_contours, start=1):
+            box_int = np.intp(box)
+            cv2.drawContours(debug_canvas, [box_int], -1, (0, 255, 0), 3)
+            center = box.mean(axis=0)
+            cv2.putText(
+                debug_canvas,
+                str(idx),
+                (int(center[0]), int(center[1])),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        cv2.imwrite(
+            str(debug_dir / f"{base_name}_debug{extension}"),
+            debug_canvas,
+        )
+        cv2.imwrite(str(debug_dir / f"{base_name}_mask.png"), mask)
+
+    print(f"[{image_path.name}] Найдено фотографий: {len(photo_contours)}")
+    print(f"[{image_path.name}] Сохранено: {processed}, каталог: {output_dir}")
+    return processed > 0
+
+
 def main() -> int:
     args = parse_args()
 
     if not args.input.exists():
-        print(f"Файл {args.input} не найден", file=sys.stderr)
+        print(f"Каталог {args.input} не найден", file=sys.stderr)
         return 1
 
-    image = cv2.imread(str(args.input))
-    if image is None:
-        print(
-            "Не удалось прочитать изображение. Поддерживаются форматы, которые умеет OpenCV.",
-            file=sys.stderr,
-        )
+    if not args.input.is_dir():
+        print(f"{args.input} не является каталогом", file=sys.stderr)
         return 1
 
-    output_dir = args.output_dir or args.input.parent
-    ensure_dir(output_dir)
-    ensure_dir(args.debug_dir)
+    if args.debug_dir:
+        ensure_dir(args.debug_dir)
 
     orientation_estimator: DlibFaceOrientation | None = None
     if args.auto_orient:
@@ -309,70 +411,30 @@ def main() -> int:
                 )
                 orientation_estimator = None
 
-    mask = preprocess(
-        image,
-        args.blur_kernel,
-        args.close_kernel,
-        *args.canny_thresholds,
+    image_paths = sorted(
+        path
+        for path in args.input.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
     )
 
-    total_area = float(image.shape[0] * image.shape[1])
-    min_area = total_area * max(args.min_area_ratio, 0.0)
-    photo_contours = find_photo_contours(mask, min_area)
-
-    if not photo_contours:
-        print(
-            "Фотографии не найдены. Попробуйте уменьшить --min-area-ratio или настроить пороги.",
-            file=sys.stderr,
-        )
+    if not image_paths:
+        print("В каталоге нет поддерживаемых изображений.", file=sys.stderr)
         return 2
 
-    def contour_key(item: tuple[np.ndarray, float]) -> tuple[float, float]:
-        box, _ = item
-        center = box.mean(axis=0)
-        return (center[1], center[0])
+    successes = 0
+    for image_path in image_paths:
+        try:
+            if process_image_file(image_path, args, orientation_estimator):
+                successes += 1
+        except Exception as exc:  # pragma: no cover - safeguards
+            print(f"[{image_path.name}] Ошибка обработки: {exc}", file=sys.stderr)
 
-    photo_contours.sort(key=contour_key)
-
-    base_name = args.input.stem
-    extension = args.input.suffix or ".jpg"
-    crop = max(args.crop, 0)
-
-    for index, (box, _area) in enumerate(photo_contours, start=1):
-        warped = warp_photo(image, box.astype("float32"))
-        if crop > 0:
-            warped = crop_margin(warped, crop)
-        if args.auto_orient and orientation_estimator is not None:
-            warped, rotation = auto_orient_photo(warped, orientation_estimator)
-            if rotation:
-                print(f"Фото {index} повернуто на {rotation} градусов")
-        output_path = output_dir / f"{base_name}{args.suffix}{index:02d}{extension}"
-        success = cv2.imwrite(str(output_path), warped)
-        if not success:
-            print(f"Не удалось сохранить {output_path}", file=sys.stderr)
-
-    if args.debug_dir:
-        debug_canvas = image.copy()
-        for idx, (box, _) in enumerate(photo_contours, start=1):
-            box_int = np.intp(box)
-            cv2.drawContours(debug_canvas, [box_int], -1, (0, 255, 0), 3)
-            center = box.mean(axis=0)
-            cv2.putText(
-                debug_canvas,
-                str(idx),
-                (int(center[0]), int(center[1])),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        cv2.imwrite(str(args.debug_dir / f"{base_name}_debug{extension}"), debug_canvas)
-        cv2.imwrite(str(args.debug_dir / f"{base_name}_mask.png"), mask)
-
-    print(f"Найдено фотографий: {len(photo_contours)}")
-    print(f"Результаты сохранены в {output_dir}")
-    return 0
+    processed_total = len(image_paths)
+    print(
+        f"Готово: обработано {successes} из {processed_total} файлов"
+        f" (каталог {args.input})."
+    )
+    return 0 if successes else 3
 
 
 if __name__ == "__main__":
