@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         help="Пороговые значения для детектора Canny (по умолчанию 50 150)",
     )
     parser.add_argument(
+        "--crop",
+        type=int,
+        default=0,
+        help="Количество пикселов, которое нужно обрезать с каждой стороны готового фото",
+    )
+    parser.add_argument(
         "--debug-dir",
         type=Path,
         default=None,
@@ -167,6 +173,20 @@ def find_photo_contours(mask: np.ndarray, min_area: float) -> list[tuple[np.ndar
     return result
 
 
+def crop_margin(image: np.ndarray, crop: int) -> np.ndarray:
+    crop = max(int(crop), 0)
+    if crop == 0:
+        return image
+    height, width = image.shape[:2]
+    x0 = min(crop, width // 2)
+    y0 = min(crop, height // 2)
+    x1 = width - x0
+    y1 = height - y0
+    if x1 <= x0 or y1 <= y0:
+        return image
+    return image[y0:y1, x0:x1]
+
+
 def main() -> int:
     args = parse_args()
 
@@ -213,9 +233,12 @@ def main() -> int:
 
     base_name = args.input.stem
     extension = args.input.suffix or ".jpg"
+    crop = max(args.crop, 0)
 
     for index, (box, _area) in enumerate(photo_contours, start=1):
         warped = warp_photo(image, box.astype("float32"))
+        if crop > 0:
+            warped = crop_margin(warped, crop)
         output_path = output_dir / f"{base_name}{args.suffix}{index:02d}{extension}"
         success = cv2.imwrite(str(output_path), warped)
         if not success:
