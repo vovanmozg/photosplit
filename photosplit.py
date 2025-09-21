@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Split scanned sheets with multiple photos into separate image files."""
 
+# vibecoded
+
 from __future__ import annotations
 
 import argparse
