@@ -171,17 +171,28 @@ def preprocess(
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     if blur_kernel > 1:
         blur_kernel = blur_kernel + (1 - blur_kernel % 2)
-        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+        gray_blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+    else:
+        gray_blurred = gray
 
-    edges = cv2.Canny(gray, canny_low, canny_high)
+    edges = cv2.Canny(gray_blurred, canny_low, canny_high)
 
     close_kernel = max(close_kernel, 3)
     if close_kernel % 2 == 0:
         close_kernel += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel, close_kernel))
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-    closed = cv2.dilate(closed, None, iterations=1)
-    return closed
+    edge_mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+    _, thresh = cv2.threshold(
+        gray_blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    fill_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(close_kernel // 2, 3),) * 2)
+    filled = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, fill_kernel, iterations=2)
+
+    combined = cv2.bitwise_or(edge_mask, filled)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    _, binary = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY)
+    return binary
 
 
 def find_photo_contours(mask: np.ndarray, min_area: float) -> list[tuple[np.ndarray, float]]:
